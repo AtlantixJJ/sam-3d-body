@@ -92,6 +92,12 @@ python demo.py \
     --output_folder <path_to_output> \
     --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
     --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+  
+python demo.py \
+    --image_folder ../../data/jianjin_custom_data/full_body_images \
+    --output_folder ../../expr/sam3dbody \
+    --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
+    --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
 ```
 
 You can also try the following lines of code with models loaded directly from [Hugging Face](https://huggingface.co/facebook)
