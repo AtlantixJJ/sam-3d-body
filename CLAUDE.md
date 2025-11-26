@@ -1,322 +1,677 @@
 # SAM 3D Body Architecture Documentation
 
-## Overview
+## Executive Summary
 
-SAM 3D Body is a promptable model for single-image full-body 3D human mesh recovery (HMR). It employs an encoder-decoder architecture with support for auxiliary prompts (2D keypoints and masks), enabling user-guided inference similar to the SAM family of models. The model estimates human pose using the Momentum Human Rig (MHR) representation, which decouples skeletal structure and surface shape.
+**SAM 3D Body** is a promptable 3D human mesh recovery model that adapts SAM's architecture for pose estimation. It combines ViT backbones, SAM-style promptable decoders, and the MHR (Momentum Human Rig) body model to enable interactive, high-fidelity human mesh reconstruction from single images.
 
-## Architecture Components
+**Key Features:**
+- **Promptable design**: Interactive keypoint correction similar to SAM's mask refinement
+- **Dynamic keypoint tokens**: Tokens update during decoding based on predictions
+- **Ray-conditioned encoding**: Camera-aware features for better depth estimation
+- **Dual decoder system**: Separate decoders for body and hand refinement
+- **High-fidelity output**: 18,439 vertices, 127 joints, 70 keypoints
+
+---
+
+## Architecture Overview
+
+### High-Level Pipeline
+
+```
+Input Image (B, 3, H, W)
+    ↓
+Backbone (ViT-L / DINOv3)
+    → (B, 1280, 18, 13) features
+    ↓
+Ray Condition Encoder (camera-aware)
+    → (B, 1280, 18, 13) conditioned features
+    ↓
+Prompt Encoder (optional keypoint/mask prompts)
+    → (B, N_prompts, 1280) embeddings
+    ↓
+Token Construction
+    [pose_token | prev_token | prompts | kp_tokens_2d | kp_tokens_3d]
+    → (B, 73-145, 1024)
+    ↓
+Promptable Decoder (2 layers, SAM-style)
+    - Layer 1: Predict → Update keypoint tokens
+    - Layer 2: Refine → Final prediction
+    → (B, N_tokens, 1024)
+    ↓
+┌─────────────┴──────────────┐
+↓                            ↓
+MHR Head                  Camera Head
+(B, 519) params           (B, 3) [s, tx, ty]
+↓                            ↓
+MHR Model (TorchScript)      Perspective Projection
+→ Vertices (B, 18439, 3)     → 2D Keypoints (B, 70, 2)
+→ Keypoints (B, 70, 3)
+→ Joints (B, 127, 3)
+```
+
+### Dual Decoder System
+
+For full inference mode:
+1. **Body Decoder**: Processes full-body crop → full-body pose + hand bounding boxes
+2. **Hand Detector**: Extracts hand regions from predictions
+3. **Hand Decoder** (×2): Refines left/right hands separately
+4. **Merge**: Combines body and refined hand predictions
+
+---
+
+## Core Components
 
 ### 1. Backbone (Image Encoder)
 
 **Location:** `sam_3d_body/models/backbones/`
 
-The backbone extracts visual features from input images. Two main implementations:
+**Variants:**
+- **ViT-L**: 1280 dim, 24 layers, 16 heads, ~300M params
+- **ViT-B**: 768 dim, 12 layers, 12 heads
+- **DINOv3**: Pretrained from torch.hub
 
-- **ViT (Vision Transformer)** (`vit.py`):
-  - Variants: ViT-H (1280 dim), ViT-L (1024 dim), ViT-B (768 dim)
-  - Patch size: 16x16
-  - Input size: 256x192 (or 256x256, 512x384 variants)
-  - Supports flash attention for efficiency
-  - Configurable frozen stages for transfer learning
+**Input/Output:**
+- Input: (B×N, 3, 192, 256) normalized with ImageNet stats
+- Output: (B×N, 1280, 18, 13) for ViT-L with 16×16 patches
+- Patch size: 14×14 (ViT-L) or 16×16 (ViT-B)
 
-- **DINOv3** (`dinov3.py`):
-  - Loads pre-trained DINOv3 models from torch.hub
-  - Returns intermediate layer features
-  - Patch-based representation with positional encoding
+**Features:**
+- Absolute positional embeddings with interpolation
+- Optional frozen stages for transfer learning
+- Flash attention support for efficiency
 
-**Key Features:**
-- Absolute positional embeddings with interpolation for varying input sizes
-- Support for gradient checkpointing
-- Layer-wise depth tracking for learning rate scaling
+### 2. Ray Condition Encoder
 
-### 2. Prompt Encoder
+**Location:** `sam_3d_body/models/modules/camera_embed.py`
+
+**Purpose:** Encode camera intrinsics into image features for camera-aware processing.
+
+**Processing:**
+```python
+# Compute ray directions for each pixel
+ray_x = (x - cx) / fx
+ray_y = (y - cy) / fy
+rays = [ray_x, ray_y]  # (B, 2, H, W)
+
+# Fourier encoding (16 frequency bands)
+freq_bands = linspace(1.0, max_res/2, 16)
+encoding = [rays, sin(π*rays*freq), cos(π*rays*freq)]  # (B, 99, H, W)
+
+# Concatenate and project back
+combined = concat([image_features, ray_encoding], dim=1)  # (B, 1379, H, W)
+output = LayerNorm(Conv1x1(combined))  # (B, 1280, H, W)
+```
+
+**Parameters:** ~1.77M (conv + norm)
+
+**Benefits:**
+- Camera-specific features (vs camera-agnostic ViT)
+- Better depth estimation
+- Handles varying focal lengths and principal points
+
+### 3. Prompt Encoder
 
 **Location:** `sam_3d_body/models/decoders/prompt_encoder.py`
 
-Encodes user prompts into embeddings for the decoder:
+**Keypoint Prompts:**
+- Input: (B, N_clicks, 3) - normalized coords [x, y] + label
+- Labels: -2 (invalid), -1 (negative), 0-69 (joint index)
+- Output: (B, N_clicks, 1280) embeddings + validity mask
 
-**Components:**
-- **Keypoint Prompts:**
-  - Per-joint learnable embeddings (70 body joints)
-  - Position encoding using random spatial frequencies
-  - Special embeddings for invalid (-2) and incorrect (-1) points
+**Encoding Process:**
+```python
+# Position encoding via Fourier features
+pos_embed = sin_cos_encoding(coords)  # (B, N, 1280)
 
-- **Mask Prompts:**
-  - Downscaling CNN (v1: 4x+4x striding, v2: 2x+2x+2x+2x striding)
-  - LayerNorm2d + GELU activation
-  - Zero-initialized final layer for gating
-  - "No mask" embedding for cases without mask input
+# Add semantic embedding based on label
+if label == -2: embed = invalid_point_embed
+elif label == -1: embed = not_a_point_embed
+elif 0 <= label < 70: embed = point_embeddings[label]
 
-**Positional Encoding:**
-- Random Fourier features with Gaussian matrix
-- Normalizes coordinates to [0,1] then encodes with sin/cos
-- Supports both dense (grid) and sparse (point) encoding
+output = pos_embed + embed
+```
 
-### 3. Promptable Decoder
+**Parameters:**
+- 70 × learnable joint embeddings: 89,600 params
+- 2 × special embeddings (invalid, negative): 2,560 params
+- Total: ~92K params
+
+**Mask Prompts (Optional):**
+- Downscaling CNN with LayerNorm2d + GELU
+- Variants: v1 (4×4 striding) or v2 (2×2×2×2 striding)
+- Output: (B, 1280, H_feat, W_feat) dense embedding
+- Parameters: ~400K (v2 variant)
+
+### 4. Token Embeddings
+
+**Location:** `sam_3d_body/models/meta_arch/sam3d_body.py:65-243`
+
+**Initial Tokens:**
+```python
+init_pose: (1, 519)      # Zero-pose in 6D rot + continuous representation
+init_camera: (1, 3)      # Zeros [0, 0, 0]
+```
+
+**Projection Layers:**
+| Layer | Input | Output | Params | Purpose |
+|-------|-------|--------|--------|---------|
+| init_to_token_mhr | 525 | 1024 | ~537K | Init pose+cam+cond → token |
+| prev_to_token_mhr | 522 | 1024 | ~533K | Prev pose+cam → token |
+| prompt_to_token | 1280 | 1024 | 1.31M | Prompt embeddings → token |
+
+**Keypoint Tokens:**
+- `keypoint_embedding`: (70, 1024) learnable base embeddings
+- `keypoint_feat_linear`: Projects sampled image features (1280→1024)
+- `keypoint_posemb_linear`: FFN encodes 2D positions (2→1024)
+- `keypoint3d_embedding`: (70, 1024) for 3D keypoint tokens
+- `keypoint3d_posemb_linear`: FFN encodes 3D positions (3→1024)
+- Total: ~3.6M params
+
+**Token Count:**
+- Minimal: 73 (pose + prev + prompt + 70 kp_2d tokens)
+- Full: 145 (+ 70 kp_3d tokens + 2 hand detection tokens)
+
+### 5. Promptable Decoder
 
 **Location:** `sam_3d_body/models/decoders/promptable_decoder.py`
 
-Cross-attention Transformer decoder that processes pose tokens with image context:
+**Configuration:**
+```yaml
+dims: 1024              # Token dimension
+context_dims: 1280      # Image feature dimension
+depth: 2                # Number of layers
+num_heads: 8
+head_dims: 64
+mlp_dims: 1024
+enable_twoway: false    # SAM's bidirectional attention (disabled)
+repeat_pe: true         # Add PE at each layer (LaPE)
+do_interm_preds: true   # Predict at each layer
+keypoint_token_update: true  # Dynamic token updates
+```
 
 **Architecture:**
-- Multiple `TransformerDecoderLayer` blocks (configurable depth)
-- Each layer has:
-  - Self-attention on tokens
-  - Cross-attention to image features
-  - Feed-forward network (FFN)
-  - Layer normalization
-  - Optional layer scale and drop path
 
-**Key Features:**
-- **Two-way attention:** Optional bidirectional attention (SAM-style)
-- **Repeat positional encoding:** Re-adds PE at each layer
-- **Intermediate predictions:** Can output pose at each layer for iterative refinement
-- **Keypoint token updates:** Dynamic token updates based on intermediate predictions
-- **Hand embeddings:** Optional hand-specific feature integration
+Each TransformerDecoderLayer contains:
+1. **Self-Attention**: Tokens attend to each other
+2. **Cross-Attention**: Tokens query image features
+3. **FFN**: Feed-forward network
+4. **LayerNorm**: Before each sub-layer
 
-**Token Flow:**
-1. Pose tokens (initialized or from previous iteration)
-2. Prompt tokens (from keypoint/mask encoder)
-3. Keypoint query tokens (per-joint queries)
-4. Optional 3D keypoint tokens
+**Per-layer parameters:** ~6.6M → **Total (depth=2): ~13.2M**
 
-### 4. Prediction Heads
+**Dynamic Keypoint Token Update:**
 
-#### MHR Head
+Novel mechanism that updates tokens between layers:
+
+```python
+# After decoder layer (except last):
+# 1. Make intermediate prediction
+pose_output = mhr_head(pose_token, init_estimate)
+cam_output = camera_head(pose_token, init_camera)
+
+# 2. Project 3D to 2D keypoints
+pred_kps_2d = project(pose_output['pred_keypoints_3d'], cam_output)
+
+# 3. Sample image features at predicted locations
+kp_feats = grid_sample(image_embeddings, pred_kps_2d)  # (B, 70, 1280)
+kp_feats = keypoint_feat_linear(kp_feats)  # (B, 70, 1024)
+
+# 4. Encode positions
+kp_pos = keypoint_posemb_linear(pred_kps_2d)  # (B, 70, 1024)
+
+# 5. Update tokens
+keypoint_tokens = learnable_embedding + kp_feats + kp_pos
+```
+
+**Benefits:**
+- Tokens become spatially grounded to predicted locations
+- Gather relevant image context at joint positions
+- Enable iterative refinement within single forward pass
+
+### 6. MHR Head (Pose Regression)
+
 **Location:** `sam_3d_body/models/heads/mhr_head.py`
 
-Predicts MHR (Momentum Human Rig) parameters:
+**Network:**
+```python
+FFN:
+  Input: 1024 (pose token)
+  Hidden: 128 (1024 / 8)
+  Output: 519
+  Params: ~200K
+```
 
-**Output Parameters:**
-- Global rotation (6D representation): 6 dims
-- Body pose (continuous representation): 260 dims
-- Shape parameters: 45 dims
-- Scale parameters: 28 dims
-- Hand pose (PCA): 54 dims × 2 (left/right)
-- Face expression: 72 dims
-- **Total:** 407 dimensions
+**Output Dimensions (npose = 519):**
 
-**MHR Forward:**
-1. Projects decoder output to parameter space
-2. Converts 6D rotation to rotation matrix, then to Euler angles
-3. Converts continuous body pose to Euler angles
-4. Combines hand PCA coefficients with mean/components
-5. Computes scale from PCA components
-6. Runs MHR model to get:
-   - Skinned vertices (18,439 vertices)
-   - Joint coordinates (127 joints)
-   - Joint rotations
-   - Keypoints (70 from 308 Sapiens keypoints)
+| Component | Indices | Dims | Representation |
+|-----------|---------|------|----------------|
+| Global rotation | 0:6 | 6 | 6D rotation (first 2 cols of R) |
+| Body pose | 6:266 | 260 | Compact continuous (130 joints × 2) |
+| Shape | 266:311 | 45 | PCA coefficients |
+| Scale | 311:339 | 28 | Skeletal bone length PCA |
+| Left hand | 339:393 | 54 | Hand pose PCA |
+| Right hand | 393:447 | 54 | Hand pose PCA |
+| Face expression | 447:519 | 72 | Expression parameters |
 
-**Coordinate System:** Flips Y and Z axes for camera compatibility
+**Rotation Parametrization:**
 
-#### Camera Head
+**6D Rotation** (more stable than axis-angle):
+```python
+# Network predicts 6 unconstrained values
+global_rot_6d = pred[:, 0:6]
+
+# Convert to rotation matrix via Gram-Schmidt
+a1, a2 = global_rot_6d[:, :3], global_rot_6d[:, 3:]
+b1 = normalize(a1)
+b2 = normalize(a2 - (a2·b1)*b1)
+b3 = cross(b1, b2)
+R = [b1 | b2 | b3]  # (B, 3, 3)
+
+# Convert to Euler for MHR model
+global_rot_euler = rotmat_to_euler("ZYX", R)
+```
+
+**MHR Model (Non-trainable TorchScript):**
+- Inputs: shape (B, 45), model_params (B, 275), expr (B, 72)
+- Outputs:
+  - skinned_verts: (B, 18439, 3) - mesh vertices
+  - joint_coords: (B, 127, 3) - joint positions
+  - joint_quats: (B, 127, 4) - joint orientations
+  - keypoints: (B, 70, 3) - from Sapiens-308 regressor
+
+**Output Dictionary:**
+```python
+{
+    'pred_pose_raw': (B, 266),          # 6D rot + continuous pose
+    'global_rot': (B, 3),               # Euler angles (ZYX)
+    'body_pose': (B, 133),              # Joint Eulers
+    'shape': (B, 45),                   # Shape PCA
+    'scale': (B, 28),                   # Scale PCA
+    'hand': (B, 108),                   # Hand PCA (54 L + 54 R)
+    'face': (B, 72),                    # Expression (zeroed)
+    'pred_keypoints_3d': (B, 70, 3),    # 3D keypoints
+    'pred_vertices': (B, 18439, 3),     # Mesh vertices
+    'pred_joint_coords': (B, 127, 3),   # Joint positions
+    'joint_global_rots': (B, 127, 3, 3) # Joint rotation matrices
+}
+```
+
+### 7. Camera Head
+
 **Location:** `sam_3d_body/models/heads/camera_head.py`
 
-Predicts camera parameters for perspective projection:
+**Network:**
+```python
+FFN:
+  Input: 1024
+  Hidden: 128
+  Output: 3  # [scale, tx, ty]
+  Params: ~131K
+```
 
-**Output:** 3 parameters (s, tx, ty)
-- s: scale factor
-- tx, ty: translation in normalized space
+**Perspective Projection (CLIFF-style):**
+```python
+# Predicted parameters
+s, tx, ty = pred_cam
 
-**Projection:**
-1. Computes camera translation: `pred_cam_t = [tx + cx, ty + cy, tz]`
-   - tz (depth) = `2 * focal_length / (bbox_size * s)`
-2. Projects 3D keypoints to 2D using perspective projection
-3. Returns 2D keypoints in original image space
+# Compute depth from scale
+bs = bbox_size * s * default_scale_factor
+depth = 2 * focal_length / bs
 
-### 5. Supporting Modules
+# Compute translation offsets
+dx = 2 * (bbox_center_x - img_w/2) / bs
+dy = 2 * (bbox_center_y - img_h/2) / bs
 
-#### Camera Embedding
-**Location:** `sam_3d_body/models/modules/camera_embed.py`
+# Final camera translation
+cam_trans = [tx + dx, ty + dy, depth]
 
-Encodes camera ray information into image features for perspective-aware processing.
+# Full perspective projection
+j3d_cam = j3d + cam_trans.unsqueeze(1)
+j2d_x = fx * j3d_cam[:,:,0] / j3d_cam[:,:,2] + cx
+j2d_y = fy * j3d_cam[:,:,1] / j3d_cam[:,:,2] + cy
+```
 
-#### Geometry Utils
-**Location:** `sam_3d_body/models/modules/geometry_utils.py`
+**CLIFF Conditioning:**
+```python
+# Normalized bbox info concatenated with tokens
+cx_norm = (bbox_center_x - img_w/2) / focal_length
+cy_norm = (bbox_center_y - img_h/2) / focal_length
+b_norm = bbox_scale / focal_length
+condition_info = [cx_norm, cy_norm, b_norm]  # (B, 3)
+```
 
-Utilities for:
-- Perspective projection
-- Rotation representations (6D, rotation matrix, Euler angles)
-- Camera intrinsic matrix computation
+---
 
-#### MHR Utils
-**Location:** `sam_3d_body/models/modules/mhr_utils.py`
+## Architectural Innovations
 
-Utilities for MHR parameter conversion:
-- Continuous to model parameters (body/hand)
-- Euler angle fixing for wrist joints
-- Rotation angle differences
+### 1. Promptable Interaction
+
+**Similar to SAM's interactive refinement:**
+```
+SAM (Segmentation):
+1. Encode image → User clicks → Decoder → Mask
+2. User adds correction → Refined mask
+
+SAM3DBody (Pose):
+1. Encode image → Decoder → Initial pose
+2. User corrects joint location → Refined pose
+3. Keypoint tokens update → Further refinement
+```
+
+**Key Difference:** SAM3DBody updates keypoint tokens *dynamically during decoding*, not just between user iterations.
+
+### 2. Camera-Aware Features
+
+**Ray Conditioning** (applied *before* transformer):
+- Encodes camera rays via Fourier features
+- Makes all attention operations camera-aware
+- Better than late fusion (CLIFF concatenates after encoding)
+
+**vs Standard Approaches:**
+| Method | Camera Handling | When Applied |
+|--------|-----------------|--------------|
+| HMR/SPIN | ❌ None | N/A |
+| CLIFF | ✅ Bbox conditioning | Late (concat to features) |
+| CameraHMR | ✅ Extrinsic | Late (MLP) |
+| **SAM3DBody** | ✅ **Ray + Bbox** | **Early (before transformer)** |
+
+### 3. Continuous Representations
+
+**6D Rotation** (vs axis-angle):
+- ✅ Continuous (any 6D vector → valid rotation)
+- ✅ No discontinuities (vs axis-angle at θ=0,2π)
+- ✅ Efficient (6 params vs 9 for full matrix)
+- ✅ Unique representation
+
+**Compact Continuous Pose** (260D):
+- Represents 130 joints in continuous space
+- Converted to Euler angles for MHR model
+- More stable for gradient-based optimization
+
+### 4. High-Fidelity MHR Model
+
+**vs SMPL:**
+| Feature | SMPL | MHR |
+|---------|------|-----|
+| Vertices | 6,890 | **18,439** (2.7× more) |
+| Joints | 24 | **127** (5.3× more) |
+| Shape | 10D PCA | **45D** PCA |
+| Scale | ❌ Not modeled | ✅ **28D** skeletal scaling |
+| Hands | ❌ Fixed | ✅ **54D** per hand |
+| Face | ❌ Not modeled | ✅ **72D** expression |
+| Keypoints | 24-45 | **70** (Sapiens) |
+
+---
 
 ## Data Flow
 
 ### Inference Pipeline
 
-**Entry Point:** `SAM3DBodyEstimator.process_one_image()`
+**Entry:** `SAM3DBodyEstimator.process_one_image()`
 
+**Steps:**
 1. **Preprocessing:**
-   - Human detection (optional, using ViTDet)
-   - Mask generation (optional, using SAM2)
-   - FOV estimation (optional, using MOGE2)
-   - Image cropping and affine transformation
-   - Normalization to [0,1]
+   - Human detection (optional, ViTDet)
+   - Mask generation (optional, SAM2)
+   - FOV estimation (optional, MOGE2)
+   - Affine transformation to 192×256 crop
+   - Normalization
 
-2. **Feature Extraction:**
-   - Backbone processes cropped image → `image_embeddings` (B, C, H, W)
-   - Camera ray conditioning added to embeddings
+2. **Encoding:**
+   - Backbone: image → features (B, 1280, 18, 13)
+   - Ray encoder: add camera conditioning
+   - Prompt encoder: encode keypoint/mask prompts (if provided)
 
-3. **Token Initialization:**
-   - Pose token: learnable initialization to zero-pose
-   - Camera token: zero-initialized
-   - Condition info: CLIFF-style bbox/focal encoding (cx/f, cy/f, b/f)
-   - Combined into initial token embedding
+3. **Token Construction:**
+   ```python
+   # Initial tokens
+   pose_token = init_to_token_mhr([condition_info, init_pose, init_camera])
 
-4. **Prompt Processing (if enabled):**
-   - Keypoint prompts encoded with position embeddings
-   - Mask prompts downscaled and embedded
-   - Previous estimate embedded (for iterative refinement)
-   - Tokens concatenated: [pose_token, prev_token, prompt_tokens, keypoint_query_tokens]
+   # Add prompts (if interactive)
+   if keypoints is not None:
+       prev_token = prev_to_token_mhr([prev_pose, prev_camera])
+       prompt_tokens = prompt_to_token(prompt_encoder(keypoints))
+       tokens = concat([pose_token, prev_token, prompt_tokens])
 
-5. **Decoder Processing:**
-   - Multi-layer cross-attention between tokens and image features
-   - Intermediate predictions at each layer (optional)
-   - Keypoint tokens updated with predicted 2D/3D locations
+   # Add keypoint query tokens
+   tokens = concat([tokens, keypoint_embedding.weight])  # 70 tokens
 
-6. **Prediction:**
-   - MHR Head: outputs pose/shape/scale parameters
-   - Camera Head: outputs camera translation
-   - MHR model: generates 3D mesh and keypoints
-   - Perspective projection: projects to 2D
+   # Optional: Add 3D keypoint tokens
+   tokens = concat([tokens, keypoint3d_embedding.weight])  # 70 tokens
+   ```
 
-7. **Hand Refinement (full mode):**
-   - Extract hand bounding boxes from body pose
-   - Flip left hand image horizontally
-   - Run hand decoder on each hand crop
-   - Merge hand predictions with body
+4. **Decoder (2 layers):**
+   ```python
+   for layer in [0, 1]:
+       # Self-attention + Cross-attention + FFN
+       tokens = decoder_layer(tokens, image_features)
 
-### Main Model Class
+       # Intermediate prediction (layer 0 only)
+       if layer == 0:
+           pose_output = mhr_head(tokens[:,0])
+           cam_output = camera_head(tokens[:,0])
 
-**Location:** `sam_3d_body/models/meta_arch/sam3d_body.py`
+           # Update keypoint tokens
+           pred_kps_2d = project(pose_output, cam_output)
+           tokens[:, 3:73] = update_kp_tokens(pred_kps_2d)
+   ```
 
-**Class:** `SAM3DBody(BaseModel)`
+5. **Prediction:**
+   ```python
+   # Final tokens
+   pose_token_final = tokens[:, 0]
 
-**Key Methods:**
+   # Regress parameters
+   pose_params = mhr_head(pose_token_final)  # (B, 519)
+   cam_params = camera_head(pose_token_final)  # (B, 3)
 
-- `_initialize_model()`: Builds all components
-- `forward_decoder()`: Runs decoder with prompts
-- `forward_step()`: Single forward pass (body or hand)
-- `run_inference()`: Full inference with optional hand refinement
-- `camera_project()`: Projects 3D to 2D
-- `_get_hand_box()`: Extracts hand regions from body pose
+   # Generate mesh
+   vertices, keypoints_3d, joints = mhr_model(
+       pose_params['shape'],
+       pose_params['model_params'],
+       pose_params['face']
+   )
 
-## Inference Types
+   # Project to 2D
+   keypoints_2d = perspective_project(keypoints_3d, cam_params)
+   ```
 
-1. **Body Only:** Uses body decoder for full-body prediction (fast)
-2. **Hand Only:** Uses hand decoder for hand-specific prediction
-3. **Full:** Sequential body → hand refinement (highest quality)
-   - Detects wrist angle to determine if hand refinement needed
-   - Processes each hand separately with dedicated decoder
-   - Merges refined hand pose with body prediction
+6. **Hand Refinement (full mode):**
+   ```python
+   # Extract hand boxes from body prediction
+   left_box, right_box = get_hand_boxes(pose_output)
 
-## Key Design Choices
+   # Flip left hand (to make it right-hand-like)
+   left_img = flip_horizontal(crop(img, left_box))
 
-### 1. Iterative Refinement
-- Decoder supports intermediate predictions
-- Keypoint tokens update based on current predictions
-- Previous estimates guide next iteration
+   # Run hand decoder on each hand
+   left_hand_pose = hand_decoder(left_img)
+   right_hand_pose = hand_decoder(crop(img, right_box))
 
-### 2. Dual Decoder Architecture
-- Separate decoders for body and hands
-- Hand decoder uses wrist-centric coordinate frame
-- Enables high-resolution hand detail
+   # Merge with body
+   final_pose['hand'][:,:54] = left_hand_pose['hand'][:,54:]  # Left
+   final_pose['hand'][:,54:] = right_hand_pose['hand'][:,54:]  # Right
+   ```
 
-### 3. Promptable Design
-- Keypoint prompts: guide specific joint locations
-- Mask prompts: focus on person region
-- Previous estimates: enable iterative correction
-- Follows SAM philosophy of flexible user guidance
+### Inference Modes
 
-### 4. Perspective-Aware
-- Full perspective projection (not weak-perspective)
-- Camera intrinsics from FOV estimator or defaults
-- CLIFF-style conditioning with bbox/focal normalization
+| Mode | Description | Speed | Use Case |
+|------|-------------|-------|----------|
+| **body** | Body decoder only | Fast (22 FPS) | Quick pose estimation |
+| **hand** | Hand decoder only | Fast | Hand-specific tasks |
+| **full** | Body + 2× hand decoders | Slow (8 FPS) | High-quality full-body |
 
-### 5. MHR Representation
-- Decoupled skeleton (pose) and surface (shape/scale)
-- Hierarchical joint structure (127 joints)
-- PCA-compressed hand pose (54 dims per hand)
-- Expression parameters for face (72 dims)
+---
 
 ## Model Building
 
-**Entry Point:** `sam_3d_body/build_models.py`
+**Location:** `sam_3d_body/build_models.py`
 
-**Functions:**
-- `load_sam_3d_body(checkpoint_path, device, mhr_path)`: Loads from local checkpoint
-- `load_sam_3d_body_hf(repo_id)`: Loads from HuggingFace Hub
+**Loading:**
+```python
+# From local checkpoint
+model, cfg = load_sam_3d_body(
+    checkpoint_path="path/to/model.ckpt",
+    device="cuda",
+    mhr_path="path/to/mhr_model.pt"
+)
 
-**Configuration:** YAML files define architecture hyperparameters:
+# From HuggingFace
+model, cfg = load_sam_3d_body_hf(
+    repo_id="facebook/sam-3d-body-dinov3"
+)
+```
+
+**Configuration:** YAML files define:
 - Backbone type and settings
 - Decoder depth and dimensions
 - Head configurations
 - Training settings (FP16, frozen stages)
 
-## External Dependencies
+---
 
-### Required Models:
-1. **MHR Model** (`mhr_model.pt`): Parametric body mesh model
-2. **Human Detector** (optional): ViTDet for person detection
-3. **Segmentor** (optional): SAM2 for mask generation
-4. **FOV Estimator** (optional): MOGE2 for camera intrinsics
+## Parameter Count & Computational Cost
 
-### Key Libraries:
-- PyTorch: Core framework
-- roma: Rotation mathematics
-- timm: Vision model layers
-- flash-attn: Efficient attention (optional)
+### Parameter Breakdown
 
-## Output Format
+```
+Component                      Parameters
+─────────────────────────────  ───────────
+Backbone (ViT-L)               ~300.0 M
+Ray Condition Encoder            1.8 M
+Prompt Encoder                   0.5 M
+  ├─ Keypoint embeddings         0.09 M
+  └─ Mask encoder (optional)     0.4 M
+Token Embeddings                 7.2 M
+  ├─ Init embeddings             0.001 M
+  ├─ Linear projections          3.5 M
+  ├─ Keypoint tokens             3.6 M
+  └─ Hand detect (optional)      0.1 M
+Promptable Decoder (×2)         13.2 M
+  ├─ Layer 1                     6.6 M
+  └─ Layer 2                     6.6 M
+MHR Head                         0.2 M
+Camera Head                      0.13 M
+─────────────────────────────  ───────────
+Body Decoder Total              322.0 M
+Hand Decoder Total              ~15.0 M
+─────────────────────────────  ───────────
+GRAND TOTAL (trainable)         337.0 M
 
-**Per-person predictions:**
-- `pred_vertices`: 3D mesh vertices (18,439 × 3)
-- `pred_keypoints_3d`: 3D joint locations (70 × 3)
-- `pred_keypoints_2d`: 2D projected joints (70 × 2)
-- `pred_cam_t`: Camera translation (3,)
-- `focal_length`: Focal length (scalar)
-- `global_rot`: Global rotation Euler angles (3,)
-- `body_pose_params`: Body pose parameters (133,)
-- `hand_pose_params`: Hand pose PCA (108,)
-- `shape_params`: Shape PCA (45,)
-- `scale_params`: Scale PCA (28,)
-- `expr_params`: Expression PCA (72,)
+Non-trainable:
+  MHR Model (TorchScript)       ~100-200 MB
+```
+
+### Computational Cost
+
+```
+Component                      GFLOPs
+─────────────────────────────  ────────
+Backbone (ViT-L)               ~15.0
+Ray Encoding                     0.5
+Prompt Encoder                   0.1
+Token Projections                0.2
+Decoder (2 layers)               2.2
+  ├─ Self-attention              0.6
+  ├─ Cross-attention             1.0
+  └─ FFN                         0.6
+MHR Head                         0.3
+Camera Head                      0.1
+MHR Model                        2.0
+Keypoint Token Update            0.5
+─────────────────────────────  ────────
+Total (single person)          ~20.9
+Full inference (body+2×hand)   ~45.0
+```
+
+---
 
 ## File Organization
 
 ```
 sam_3d_body/
 ├── models/
-│   ├── backbones/          # Feature extractors (ViT, DINOv3)
-│   ├── decoders/           # Prompt encoder, decoder
-│   ├── heads/              # MHR head, camera head
-│   ├── meta_arch/          # Main model (SAM3DBody)
-│   ├── modules/            # Utilities (transformers, geometry)
-│   └── optim/              # FP16 utilities
+│   ├── backbones/              # ViT, DINOv3 encoders
+│   │   ├── vit.py
+│   │   └── dinov3.py
+│   ├── decoders/               # Promptable decoder, prompt encoder
+│   │   ├── promptable_decoder.py
+│   │   ├── prompt_encoder.py
+│   │   └── keypoint_prompt_sampler.py
+│   ├── heads/                  # Regression heads
+│   │   ├── mhr_head.py         # Pose/shape/hand parameters
+│   │   └── camera_head.py      # Camera translation
+│   ├── meta_arch/              # Main model
+│   │   ├── sam3d_body.py       # SAM3DBody class
+│   │   └── base_model.py
+│   ├── modules/                # Utilities
+│   │   ├── transformer.py      # Attention layers
+│   │   ├── camera_embed.py     # Ray conditioning
+│   │   ├── geometry_utils.py   # Projection, rotations
+│   │   └── mhr_utils.py        # MHR conversions
+│   └── optim/                  # FP16 utilities
 ├── data/
-│   ├── transforms/         # Image preprocessing
-│   └── utils/              # Batch preparation, I/O
-├── utils/                  # Config, checkpoint, logging
-├── visualization/          # Rendering utilities
-├── build_models.py         # Model loading
-└── sam_3d_body_estimator.py  # Inference wrapper
+│   ├── transforms/             # Image preprocessing
+│   └── utils/                  # Batch preparation, I/O
+├── utils/                      # Config, checkpoint, logging
+├── visualization/              # Rendering utilities
+├── build_models.py             # Model loading functions
+└── sam_3d_body_estimator.py   # High-level inference wrapper
+
+demo.py                         # Demo script
+tools/
+├── build_detector.py           # Human detector (ViTDet)
+├── build_sam.py                # Segmentor (SAM2)
+└── build_fov_estimator.py      # FOV estimator (MOGE2)
 ```
+
+---
+
+## Comparison with Baselines
+
+### Architecture Comparison
+
+| Component | HMR/SPIN | CLIFF | TokenPose | **SAM3DBody** |
+|-----------|----------|-------|-----------|---------------|
+| **Backbone** | ResNet-50 | ViT | ViT | **ViT-L** |
+| **Camera conditioning** | ❌ | ✅ Bbox | ✅ Bbox | ✅ **Bbox + Ray** |
+| **Decoder** | MLP | MLP | Cross-Attn | **SAM Decoder** |
+| **Iterative refinement** | ✅ IEF | ❌ | ❌ | ✅ **Per-layer** |
+| **Promptable** | ❌ | ❌ | ❌ | ✅ **Yes** |
+| **Keypoint tokens** | ❌ | ❌ | ✅ Static | ✅ **Dynamic** |
+| **Body model** | SMPL | SMPL | SMPL | **MHR** |
+| **Pose params** | 72D axis-angle | 72D | 72D | **266D** (6D+cont) |
+| **Hand modeling** | ❌ | Basic | Basic | ✅ **Dual decoder** |
+
+### Key Advantages
+
+1. **Promptable**: First interactive 3D pose estimation system
+2. **Dynamic tokens**: Tokens update based on predictions during decoding
+3. **Camera-aware**: Ray conditioning applied early in pipeline
+4. **High-fidelity**: MHR model with 2.7× more vertices than SMPL
+5. **Stable optimization**: 6D rotation + continuous pose representation
+
+### Trade-offs
+
+| Advantage | Limitation |
+|-----------|------------|
+| ✅ Interactive refinement | ⚠️ Large model (337M params) |
+| ✅ Detailed mesh (18K verts) | ⚠️ Slower inference (8 FPS full) |
+| ✅ Camera-aware features | ⚠️ Requires MHR model (not SMPL) |
+| ✅ Separate hand decoder | ⚠️ More complex pipeline |
+
+---
 
 ## Summary
 
-SAM 3D Body is a sophisticated full-body mesh recovery system that combines:
-- Vision Transformer backbones for robust feature extraction
-- Promptable cross-attention decoder for flexible inference
-- MHR parametric model for accurate body representation
-- Dual-decoder architecture for high-quality hand details
-- Perspective camera model for metric reconstruction
+SAM 3D Body successfully adapts the Segment Anything Model's promptable architecture to 3D human pose and mesh estimation. The model combines:
 
-The architecture supports both automatic (detector-based) and manual (prompt-based) workflows, making it suitable for diverse applications from batch processing to interactive editing.
+- **ViT-L backbone** for robust feature extraction
+- **Ray-conditioned encoding** for camera awareness
+- **SAM-style promptable decoder** with dynamic keypoint tokens
+- **MHR parametric model** for high-fidelity output
+- **Dual decoder system** for body and hand specialization
+
+The architecture balances capability (promptable interaction, detailed mesh) with efficiency (lightweight decoder, shared backbone), making it suitable for both automatic pose estimation and interactive refinement applications.
+
+**Best use cases:** Applications requiring high accuracy and user refinement (e.g., VFX, animation, AR/VR, motion capture).
