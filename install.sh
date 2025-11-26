@@ -1,3 +1,6 @@
+# better copy this installation script line to line rather than running it directly
+# because conda activate might fail
+
 conda create -n sam_3d_body python=3.11 -y
 conda activate sam_3d_body
 

@@ -98,6 +98,27 @@ python demo.py \
     --output_folder ../../expr/sam3dbody \
     --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
     --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+
+CUDA_VISIBLE_DEVICES=4 python demo_save.py \
+    --folder_root ../../data/LHM-fitting/LHM-Human4DiT \
+    --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
+    --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+
+CUDA_VISIBLE_DEVICES=5 python demo_save.py \
+    --folder_root ../../data/LHM-fitting/LHM-4DDress \
+    --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
+    --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+
+CUDA_VISIBLE_DEVICES=6 python demo_save.py \
+    --folder_root ../../data/LHM-fitting/LHM-2K2K \
+    --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
+    --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+
+CUDA_VISIBLE_DEVICES=7 python demo_save.py \
+    --folder_root ../../data/LHM-fitting/LHM-THuman21 \
+    --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
+    --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+
 ```
 
 You can also try the following lines of code with models loaded directly from [Hugging Face](https://huggingface.co/facebook)
